@@ -630,7 +630,71 @@ class EfficientNet(flax.nn.Module):
     x = Head(x, config, num_classes, train=train)
 
     return x
-# pytype: enable=attribute-error
+
+  def apply_hid(self,
+            x: jnp.ndarray,
+            config: ModelConfig,
+            num_classes: int = 1000,
+            train: bool = True) -> jnp.ndarray:
+    """Returns the output of the EfficientNet model.
+
+    Args:
+      x: The input batch of images.
+      config: The model config.
+      num_classes: Dimension of the output layer.
+      train: Whether we are in training or inference.
+
+    Returns:
+      The output of efficientnet
+    """
+    config = copy.deepcopy(config)
+    depth_coefficient = config.depth_coefficient
+    blocks = config.blocks
+    drop_connect_rate = config.drop_connect_rate
+    xl = []
+    resolution = config.resolution
+    if x.shape[1:3] != (resolution, resolution):
+      raise ValueError('Wrong input size. Model was expecting ' +
+                       'resolution {} '.format((resolution, resolution)) +
+                       'but got input of resolution {}'.format(x.shape[1:3]))
+
+    # Build stem
+    x = Stem(x, config, train=train)
+    xl.append(x)
+
+    # Build blocks
+    num_blocks_total = sum(
+        round_repeats(block.num_repeat, depth_coefficient) for block in blocks)
+    block_num = 0
+
+    for block in blocks:
+      assert block.num_repeat > 0
+      # Update block input and output filters based on depth multiplier
+      block.input_filters = round_filters(block.input_filters, config)
+      block.output_filters = round_filters(block.output_filters, config)
+      block.num_repeat = round_repeats(block.num_repeat, depth_coefficient)
+
+      # The first block needs to take care of stride and filter size increase
+      drop_rate = drop_connect_rate * float(block_num) / num_blocks_total
+      config.drop_connect_rate = drop_rate
+      x = MBConvBlock(x, block, config, train=train)
+      xl.append(x)
+      block_num += 1
+      if block.num_repeat > 1:
+        block.input_filters = block.output_filters
+        block.strides = [1, 1]
+
+        for _ in range(block.num_repeat - 1):
+          drop_rate = drop_connect_rate * float(block_num) / num_blocks_total
+          config.drop_connect_rate = drop_rate
+          x = MBConvBlock(x, block, config, train=train)
+          xl.append(x)
+          block_num += 1
+
+    x = Head(x, config, num_classes, train=False)
+    
+    return xl, x
+
 
 
 def get_efficientnet_module(model_name: str,

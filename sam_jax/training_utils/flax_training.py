@@ -222,30 +222,59 @@ def create_optimizer(model: flax.nn.Model,
   return optimizer
 
 
+def pr_dim(hid):
+  N = hid.shape[0]
+  hid = hid - hid.mean(0)
+  if hid.shape[0] >= hid.shape[1]:
+    C = hid.T @ hid / (N-1)
+  else:
+    C = hid @ hid.T / (N-1)
+  ew, ev = jnp.linalg.eigh(hid)
+  return jnp.sum(ew)**2/jnp.sum(ew**2)
+
+def pr_dim_loss(hid_list: List[jnp.ndarray],
+                       dim_target: float) -> jnp.ndarray:
+  """returns the participation ratio dimensionality regularizer loss.
+
+  args:
+    hid_list: list of hidden unit activations.
+    dim_target: target dimensionality.
+
+  returns:
+      mse between pr dim and target
+  """
+  dim_loss = 0
+  for hid in hid_list:
+    hid = hid.reshape(hid.shape[0], -1)
+    hprdim = pr_dim(hid)
+    dim_loss = dim_loss + (hprdim - dim_target)**2
+
+  return jnp.nan_to_num(dim_loss)  # set to zero if there is no non-masked samples.
+
 def cross_entropy_loss(logits: jnp.ndarray,
                        one_hot_labels: jnp.ndarray,
-                       mask: Optional[jnp.ndarray] = None) -> jnp.ndarray:
-  """Returns the cross entropy loss between some logits and some labels.
+                       mask: optional[jnp.ndarray] = none) -> jnp.ndarray:
+  """returns the cross entropy loss between some logits and some labels.
 
-  Args:
-    logits: Output of the model.
-    one_hot_labels: One-hot encoded labels. Dimensions should match the logits.
-    mask: Mask to apply to the loss to ignore some samples (usually, the padding
-      of the batch). Array of ones and zeros.
+  args:
+    logits: output of the model.
+    one_hot_labels: one-hot encoded labels. dimensions should match the logits.
+    mask: mask to apply to the loss to ignore some samples (usually, the padding
+      of the batch). array of ones and zeros.
 
-  Returns:
-    The cross entropy, averaged over the first dimension (samples).
+  returns:
+    the cross entropy, averaged over the first dimension (samples).
   """
-  if FLAGS.label_smoothing > 0:
+  if flags.label_smoothing > 0:
     smoothing = jnp.ones_like(one_hot_labels) / one_hot_labels.shape[-1]
-    one_hot_labels = ((1-FLAGS.label_smoothing) * one_hot_labels
-                      + FLAGS.label_smoothing * smoothing)
+    one_hot_labels = ((1-flags.label_smoothing) * one_hot_labels
+                      + flags.label_smoothing * smoothing)
   log_softmax_logits = jax.nn.log_softmax(logits)
-  if mask is None:
+  if mask is none:
     mask = jnp.ones([logits.shape[0]])
   mask = mask.reshape([logits.shape[0], 1])
   loss = -jnp.sum(one_hot_labels * log_softmax_logits * mask) / mask.sum()
-  return jnp.nan_to_num(loss)  # Set to zero if there is no non-masked samples.
+  return jnp.nan_to_num(loss)  # set to zero if there is no non-masked samples.
 
 
 def error_rate_metric(logits: jnp.ndarray,
@@ -469,7 +498,8 @@ def train_step(
     batch: Dict[str, jnp.ndarray],
     prng_key: jnp.ndarray,
     learning_rate_fn: Callable[[int], float],
-    l2_reg: float
+    l2_reg: float,
+    pretrain: bool = False
 ) -> Tuple[flax.optim.Optimizer, flax.nn.Collection, Dict[str, float], float]:
   """Performs one gradient step.
 
@@ -504,12 +534,22 @@ def train_step(
     """
     with flax.nn.stateful(state) as new_state:
       with flax.nn.stochastic(prng_key):
-        try:
-          logits = model(
+        if pretrain:
+          try:
+            xl, logits = model.apply_hid(
               batch['image'], train=True, true_gradient=true_gradient)
-        except TypeError:
-          logits = model(batch['image'], train=True)
-    loss = cross_entropy_loss(logits, batch['label'])
+          except TypeError:
+            xl, logits = model.apply_hid(batch['image'], train=True)
+        else:
+          try:
+            logits = model(
+              batch['image'], train=True, true_gradient=true_gradient)
+          except TypeError:
+            logits = model(batch['image'], train=True)
+    if pretrain:
+      loss = dim_loss(xl)
+    else:
+      loss = cross_entropy_loss(logits, batch['label'])
     # We apply weight decay to all parameters, including bias and batch norm
     # parameters.
     weight_penalty_params = jax.tree_leaves(model.params)
@@ -535,19 +575,18 @@ def train_step(
     """
     # compute gradient on the whole batch
     (_, (inner_state, _)), grad = jax.value_and_grad(
-        lambda m: forward_and_loss(m, true_gradient=True), has_aux=True)(model)
+        lambda m: forward_and_loss(m, true_gradient=True, pretrain=pretrain), has_aux=True)(model)
     if FLAGS.sync_perturbations:
       if FLAGS.inner_group_size is None:
         grad = jax.lax.pmean(grad, 'batch')
       else:
         grad = jax.lax.pmean(
-            grad, 'batch',
-            axis_index_groups=local_replica_groups(FLAGS.inner_group_size))
+        grad, 'batch',
+        axis_index_groups=local_replica_groups(FLAGS.inner_group_size))
     grad = dual_vector(grad)
     noised_model = jax.tree_multimap(lambda a, b: a + rho * b,
                                      model, grad)
-    (_, (_, logits)), grad = jax.value_and_grad(
-        forward_and_loss, has_aux=True)(noised_model)
+    (_, (_, logits)), grad = jax.value_and_grad(lambda m: forward_and_loss(m, pretrain=pretrain), has_aux=True)(noised_model)
     return (inner_state, logits), grad
 
   lr = learning_rate_fn(step)
@@ -556,9 +595,7 @@ def train_step(
   if rho > 0:  # SAM loss
     (new_state, logits), grad = get_sam_gradient(optimizer.target, rho)
   else:  # Standard SGD
-    (_, (new_state, logits)), grad = jax.value_and_grad(
-        forward_and_loss, has_aux=True)(
-            optimizer.target)
+    (_, (new_state, logits)), grad = jax.value_and_grad(lambda m: forward_and_loss(m, pretrain=pretrain), has_aux=True)(optimizer.target)
 
   # We synchronize the gradients across replicas by averaging them.
   grad = jax.lax.pmean(grad, 'batch')
@@ -704,7 +741,8 @@ def train_for_one_epoch(
     prng_key: jnp.ndarray, pmapped_train_step: _TrainStep,
     pmapped_update_ema: Optional[_EMAUpdateStep],
     moving_averages: Optional[efficientnet_optim.ExponentialMovingAverage],
-    summary_writer: tensorboard.SummaryWriter
+    summary_writer: tensorboard.SummaryWriter,
+    pretrain = False
 ) -> Tuple[flax.optim.Optimizer, flax.nn.Collection,
            Optional[efficientnet_optim.ExponentialMovingAverage]]:
   """Trains the model for one epoch.
@@ -739,7 +777,7 @@ def train_for_one_epoch(
     sharded_keys = common_utils.shard_prng_key(step_key)
 
     optimizer, state, metrics, lr = pmapped_train_step(
-        optimizer, state, batch, sharded_keys)
+        optimizer, state, batch, sharded_keys, pretrain)
     cnt += 1
 
     if moving_averages is not None:
@@ -763,7 +801,7 @@ def train_for_one_epoch(
 def train(optimizer: flax.optim.Optimizer,
           state: flax.nn.Collection,
           dataset_source: dataset_source_lib.DatasetSource,
-          training_dir: str, num_epochs: int):
+          training_dir: str, num_epochs: int, pretrain: bool = False):
   """Trains the model.
 
   Args:
@@ -838,8 +876,25 @@ def train(optimizer: flax.optim.Optimizer,
           l2_reg=FLAGS.weight_decay),
       axis_name='batch',
       donate_argnums=(0, 1))
+  pmapped_train_step_pretrain = jax.pmap(
+      functools.partial(
+          train_step,
+          learning_rate_fn=learning_rate_fn,
+          l2_reg=FLAGS.weight_decay,
+          pretrain=True),
+      axis_name='batch',
+      donate_argnums=(0, 1))
   pmapped_eval_step = jax.pmap(eval_step, axis_name='batch')
-
+  if not gfile.exists(checkpoint_dir):
+    tick = time.time()
+    optimizer, state, moving_averages = train_for_one_epoch(
+        dataset_source, optimizer, state, prng_key, pmapped_train_step_pretrain,
+        pmapped_update_ema, moving_averages, summary_writer)
+    tock = time.time()
+    print(f"Pretraining time: {toc-tic}")
+    c_path = os.path.join(checkpoint_dir, 'additional_ckpt_pretrain')
+    save_checkpoint(optimizer, state, c_path, epochs_id)
+    
   time_at_last_checkpoint = time.time()
   for epochs_id in range(initial_epoch, num_epochs):
     if epochs_id in FLAGS.additional_checkpoints_at_epochs:
